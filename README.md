@@ -19,6 +19,7 @@ Copy `.env.example` to `.env` and configure:
 | `PORT` | `3000` | Server port |
 | `NODE_ENV` | — | Set to `development` for error stack traces |
 | `BITCOIN_NETWORK` | `signet` | `"signet"` or `"testnet"` |
+| `SIGNING_MAX_WAIT_TIME_SECONDS` | `60` | Max wait time before async signature requests time out |
 
 ## Starting the Server
 
@@ -628,6 +629,354 @@ curl -X POST http://localhost:3000/api/bitcoin/wsh/send \
 
 ---
 
+### Wallet Management
+
+Wallet endpoints provide UUID-based wallet identity, mirroring the production Griffin wallet service (`WalletServiceClient`). Wallets are stored in-memory for this POC. All endpoints are under `/api/bitcoin/wallets/`.
+
+#### Create Wallet
+
+Generates a new keypair, assigns a UUID wallet ID, and derives all address types.
+
+```bash
+curl -X POST http://localhost:3000/api/bitcoin/wallets \
+  -H "Content-Type: application/json" \
+  -d '{
+    "label": "treasury-hot",
+    "businessType": "VAULT"
+  }'
+```
+
+Both fields are optional. `businessType` can be `VAULT`, `TRADING`, `PLEDGED`, `STAKING`, `OMNIBUS`, or `FEE_SPONSOR`.
+
+**Response (201):**
+```json
+{
+  "success": true,
+  "message": "Wallet created successfully",
+  "data": {
+    "id": "a7c3e1f0-4b2d-4e8a-9f1c-6d5b3a2e0f8c",
+    "createdAt": "2026-04-27T10:00:00.000Z",
+    "updatedAt": "2026-04-27T10:00:00.000Z",
+    "businessStatus": "ACTIVE",
+    "name": "treasury-hot",
+    "businessType": "VAULT",
+    "technicalType": "SEGREGATED",
+    "_embedded": {
+      "addresses": [
+        { "id": "...", "address": "tb1q...", "tagMemo": "p2wpkh" },
+        { "id": "...", "address": "mqwh...", "tagMemo": "p2pkh" },
+        { "id": "...", "address": "2NC9...", "tagMemo": "p2sh" },
+        { "id": "...", "address": "tb1p...", "tagMemo": "p2tr" }
+      ],
+      "blockchain": { "name": "BITCOIN", "network": "TESTNET" }
+    }
+  }
+}
+```
+
+#### List Wallets
+
+```bash
+curl http://localhost:3000/api/bitcoin/wallets
+```
+
+**Response:** `GetWallets200Response` shape with `items[]`, `total`, `offset`, `limit`.
+
+#### Get Wallet by ID
+
+Returns wallet details enriched with live balance from mempool.
+
+```bash
+curl http://localhost:3000/api/bitcoin/wallets/<walletId>
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "data": {
+    "id": "a7c3e1f0-...",
+    "businessStatus": "ACTIVE",
+    "name": "treasury-hot",
+    "businessType": "VAULT",
+    "_embedded": { "addresses": [...], "blockchain": {...} },
+    "balance": 50000,
+    "utxoCount": 2
+  }
+}
+```
+
+#### Get Wallet Addresses
+
+```bash
+curl http://localhost:3000/api/bitcoin/wallets/<walletId>/addresses
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "data": {
+    "walletId": "a7c3e1f0-...",
+    "addresses": [
+      { "id": "...", "address": "tb1q...", "tagMemo": "p2wpkh" },
+      { "id": "...", "address": "mqwh...", "tagMemo": "p2pkh" }
+    ],
+    "primaryAddress": "tb1q..."
+  }
+}
+```
+
+#### Get Public Key
+
+Mirrors `WalletServiceClient.getPublicKey()` returning `GetPublicKey200Response`.
+
+```bash
+curl http://localhost:3000/api/bitcoin/wallets/<walletId>/public-key
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "data": {
+    "id": "a7c3e1f0-...",
+    "businessType": "VAULT",
+    "publicKey": "02a1633cafcc01ebfb6d78e39f687a1f0995c62fc95f51ead10a02ee0be551b5dc"
+  }
+}
+```
+
+---
+
+### Signing Service
+
+Dedicated signing endpoints mirror the production signing service (`SigningServiceClient`). They support both asynchronous (fire-then-poll) and synchronous signing. All endpoints are under `/api/bitcoin/signing/`.
+
+The asynchronous flow uses threshold-based timeout logic matching the production `CustodyService`:
+- **`IN_PROCESSING` within threshold** → HTTP 425 (Too Early), caller should retry
+- **`IN_PROCESSING` past threshold** → HTTP 408, timed out
+- **`FAILED` within threshold** → HTTP 422, signing failure
+- **`DONE`** → HTTP 200, signature returned as hex
+
+Configure the threshold via `SIGNING_MAX_WAIT_TIME_SECONDS` env var (default: 60s).
+
+#### Create Async Signature Request
+
+Submits an unsigned PSBT (hex) for background signing. Returns immediately with a `signatureId` to poll.
+
+Mirrors: `SigningServiceClient.asynchronousSignTransaction()` → `POST /v1/signature-requests`
+
+```bash
+curl -X POST http://localhost:3000/api/bitcoin/signing/v1/signature-requests \
+  -H "Content-Type: application/json" \
+  -d '{
+    "walletId": "a7c3e1f0-4b2d-4e8a-9f1c-6d5b3a2e0f8c",
+    "unsignedPayload": "70736274ff...",
+    "signatureEncoding": "DER"
+  }'
+```
+
+`signatureEncoding` is optional. Bitcoin uses `DER`; EVM/Solana use `RAW`.
+
+**Response (202):**
+```json
+{
+  "success": true,
+  "message": "Signature request created — poll GET /v1/signature-requests/<id> for status",
+  "data": {
+    "id": "b8d4f2a1-5c3e-4f9b-a0d2-7e6c4b3d1f9a",
+    "status": "IN_PROCESSING"
+  }
+}
+```
+
+#### Poll Signature Request
+
+Polls for the signature result. Applies threshold timeout logic.
+
+Mirrors: `SigningServiceClient.fetchAsynchronousSignedTransaction()` → `GET /v1/signature-requests/:signatureId`
+
+```bash
+curl http://localhost:3000/api/bitcoin/signing/v1/signature-requests/<signatureId>
+```
+
+Optional query parameter: `?requestedTime=2026-04-27T10:00:00.000Z` (for threshold calculation).
+
+**Response when still processing (425):**
+```json
+{
+  "success": true,
+  "message": "Signature is still being processed — retry shortly",
+  "data": {
+    "id": "b8d4f2a1-...",
+    "createdAt": "2026-04-27T10:00:00.000Z",
+    "updatedAt": "2026-04-27T10:00:00.000Z",
+    "payload": { "walletId": "a7c3e1f0-...", "unsignedPayload": "...", "signatureEncoding": "DER" },
+    "status": "IN_PROCESSING"
+  }
+}
+```
+
+**Response when done (200):**
+```json
+{
+  "success": true,
+  "message": "Signature retrieved successfully",
+  "data": {
+    "id": "b8d4f2a1-...",
+    "createdAt": "2026-04-27T10:00:00.000Z",
+    "updatedAt": "2026-04-27T10:00:02.000Z",
+    "payload": { "walletId": "a7c3e1f0-...", "unsignedPayload": "..." },
+    "status": "DONE",
+    "signature": "02000000..."
+  }
+}
+```
+
+#### Synchronous Sign
+
+Signs immediately and returns the signature in one call. No polling required.
+
+Mirrors: `SigningServiceClient.synchronousSignTransaction()` → `POST /v1/sign`
+
+```bash
+curl -X POST http://localhost:3000/api/bitcoin/signing/v1/sign \
+  -H "Content-Type: application/json" \
+  -d '{
+    "walletId": "a7c3e1f0-4b2d-4e8a-9f1c-6d5b3a2e0f8c",
+    "unsignedPayload": "70736274ff...",
+    "authorizationApprovals": ["challenge-token-1"]
+  }'
+```
+
+`authorizationApprovals` is optional (accepted for API parity, not enforced in POC).
+
+**Response (200):**
+```json
+{
+  "success": true,
+  "message": "Transaction signed successfully",
+  "data": {
+    "signature": "02000000..."
+  }
+}
+```
+
+---
+
+### Wallet Signing & Broadcasting (Convenience)
+
+These endpoints on `/api/bitcoin/wallets/:walletId/` combine wallet resolution with signing — the wallet's private key is resolved internally so you only need the `walletId`.
+
+#### Initiate Async Sign via Wallet
+
+```bash
+curl -X POST http://localhost:3000/api/bitcoin/wallets/<walletId>/sign-transaction \
+  -H "Content-Type: application/json" \
+  -d '{
+    "unsignedPayload": "70736274ff...",
+    "signatureEncoding": "DER"
+  }'
+```
+
+**Response (202):**
+```json
+{
+  "success": true,
+  "data": {
+    "signatureId": "b8d4f2a1-...",
+    "status": "IN_PROCESSING",
+    "requestedTime": "2026-04-27T10:00:00.000Z"
+  }
+}
+```
+
+#### Poll Async Sign via Wallet
+
+```bash
+curl http://localhost:3000/api/bitcoin/wallets/<walletId>/sign-transaction/<signatureId>
+```
+
+**Response when done (200):**
+```json
+{
+  "success": true,
+  "data": {
+    "signatureId": "b8d4f2a1-...",
+    "status": "DONE",
+    "signedTransaction": {
+      "signature": "02000000...",
+      "address": "tb1q..."
+    }
+  }
+}
+```
+
+Returns `425` while `IN_PROCESSING`, `422` on `FAILED`.
+
+#### Send (Managed Flow)
+
+One-call shortcut: fetches UTXOs, builds PSBT, converts to hex, submits for async signing. Returns a `signatureId` to poll.
+
+```bash
+curl -X POST http://localhost:3000/api/bitcoin/wallets/<walletId>/send \
+  -H "Content-Type: application/json" \
+  -d '{
+    "recipientAddress": "tb1qxkgagapsdllm9mnz7gfya5gcttgwhv8sxnlf0k",
+    "amount": 10000
+  }'
+```
+
+**Response (202):**
+```json
+{
+  "success": true,
+  "message": "Transaction built and submitted for signing",
+  "data": {
+    "signatureId": "b8d4f2a1-...",
+    "status": "IN_PROCESSING",
+    "requestedTime": "2026-04-27T10:00:00.000Z",
+    "walletId": "a7c3e1f0-...",
+    "transaction": {
+      "sourceAddress": "tb1q...",
+      "recipientAddress": "tb1qxkgagapsdllm9mnz7gfya5gcttgwhv8sxnlf0k",
+      "amount": 10000,
+      "fee": 141,
+      "inputCount": 1,
+      "outputCount": 2
+    },
+    "next": "Poll GET .../sign-transaction/<signatureId> then POST .../broadcast/<signatureId>"
+  }
+}
+```
+
+#### Broadcast Signed Transaction
+
+After the signature request reaches `DONE`, broadcast it.
+
+```bash
+curl -X POST http://localhost:3000/api/bitcoin/wallets/<walletId>/broadcast/<signatureId>
+```
+
+**Response (200):**
+```json
+{
+  "success": true,
+  "message": "Transaction broadcast successfully",
+  "data": {
+    "txId": "a1b2c3d4...",
+    "walletId": "a7c3e1f0-...",
+    "signatureId": "b8d4f2a1-...",
+    "explorerUrl": "https://mempool.space/signet/tx/a1b2c3d4..."
+  }
+}
+```
+
+Returns `409` if signing is still `IN_PROCESSING`, `422` if `FAILED`.
+
+---
+
 ## End-to-End Workflows
 
 ### Standard Transaction (P2WPKH)
@@ -711,6 +1060,94 @@ curl -X POST http://localhost:3000/api/bitcoin/broadcast \
   }'
 ```
 
+### Wallet-Based Async Signing (Managed Flow)
+
+This is the recommended flow for Bitcoin transactions — it mirrors the production transaction-gateway lifecycle: `createWallet → formulateTransaction → asynchronousSign → fetchSignature → broadcast`.
+
+```bash
+# 1. Create a wallet
+curl -X POST http://localhost:3000/api/bitcoin/wallets \
+  -H "Content-Type: application/json" \
+  -d '{ "label": "my-wallet" }'
+# Save the walletId and primaryAddress from the response
+
+# 2. Fund the wallet address using a faucet:
+#    Signet:  https://signetfaucet.com/
+#    Testnet: https://testnet-faucet.mempool.co/
+
+# 3. Verify funds arrived
+curl http://localhost:3000/api/bitcoin/wallets/<walletId>
+# Check the "balance" field in the response
+
+# 4. Submit transaction for async signing
+curl -X POST http://localhost:3000/api/bitcoin/wallets/<walletId>/send \
+  -H "Content-Type: application/json" \
+  -d '{
+    "recipientAddress": "<recipient-address>",
+    "amount": 10000
+  }'
+# Save the signatureId from the response
+
+# 5. Poll for signing completion (retry until status is DONE)
+curl http://localhost:3000/api/bitcoin/wallets/<walletId>/sign-transaction/<signatureId>
+# 425 = still processing (retry after ~1s)
+# 200 = DONE, signature ready
+
+# 6. Broadcast the signed transaction
+curl -X POST http://localhost:3000/api/bitcoin/wallets/<walletId>/broadcast/<signatureId>
+# Returns txId and explorer URL
+
+# 7. Monitor confirmation
+curl http://localhost:3000/api/bitcoin/monitor/<txId>
+```
+
+### Signing Service Direct (Low-Level)
+
+Use the signing service endpoints directly when you have a pre-built PSBT hex and want full control over the signing lifecycle.
+
+```bash
+# 1. Create a wallet (if you haven't already)
+curl -X POST http://localhost:3000/api/bitcoin/wallets \
+  -H "Content-Type: application/json" \
+  -d '{ "label": "signer" }'
+# Save walletId
+
+# 2. Build a PSBT using existing /api/bitcoin/build-transaction, get psbt base64
+#    Convert base64 to hex for the signing service:
+#    echo -n '<psbtBase64>' | base64 -d | xxd -p -c0
+
+# 3. Submit to signing service (async)
+curl -X POST http://localhost:3000/api/bitcoin/signing/v1/signature-requests \
+  -H "Content-Type: application/json" \
+  -d '{
+    "walletId": "<walletId>",
+    "unsignedPayload": "<psbt-hex>",
+    "signatureEncoding": "DER"
+  }'
+# Save the id (signatureId) from the response
+
+# 4. Poll until DONE
+curl http://localhost:3000/api/bitcoin/signing/v1/signature-requests/<signatureId>
+# 425 = retry, 200 = done (signature field contains signed tx hex)
+
+# 5. Broadcast the signed transaction
+curl -X POST http://localhost:3000/api/bitcoin/broadcast \
+  -H "Content-Type: application/json" \
+  -d '{ "txHex": "<signature-hex-from-step-4>" }'
+```
+
+Or use synchronous signing for immediate results:
+
+```bash
+curl -X POST http://localhost:3000/api/bitcoin/signing/v1/sign \
+  -H "Content-Type: application/json" \
+  -d '{
+    "walletId": "<walletId>",
+    "unsignedPayload": "<psbt-hex>"
+  }'
+# Returns { signature: "02000000..." } immediately — broadcast with /api/bitcoin/broadcast
+```
+
 ### Message Signing & Verification
 
 ```bash
@@ -776,8 +1213,14 @@ Minimum output value is **546 sats**. Transactions with smaller outputs are reje
 | Status | Meaning |
 |--------|---------|
 | `200` | Success |
+| `201` | Resource created (wallet) |
+| `202` | Accepted — async operation started (signature request submitted) |
 | `400` | Bad request (validation errors, insufficient funds, invalid keys) |
-| `404` | Endpoint not found |
+| `404` | Resource or endpoint not found |
+| `408` | Request timeout (signature exceeded threshold wait time) |
+| `409` | Conflict (e.g., trying to broadcast while signing is still `IN_PROCESSING`) |
+| `422` | Unprocessable (signing failed) |
+| `425` | Too Early — signature still `IN_PROCESSING`, caller should retry |
 | `429` | Rate limit exceeded (100 requests per 15 minutes per IP) |
 | `500` | Internal server error |
 
@@ -796,11 +1239,15 @@ src/
     transaction.js       # P2WPKH transaction lifecycle
     message.js           # Message signing/verification
     multisig.js          # P2WSH/P2SH-P2WSH multisig operations
+    wallet.js            # UUID wallet store, WalletRES shape (mirrors WalletServiceClient)
+    signing.js           # Async/sync signing, threshold timeout (mirrors SigningServiceClient)
   middleware/
     validation.js        # Request validation, response helpers
   routes/
-    bitcoin.js           # /api/bitcoin/* endpoints
-    multisig.js          # /api/bitcoin/wsh/* endpoints
+    bitcoin.js           # /api/bitcoin/* — standard P2WPKH endpoints
+    multisig.js          # /api/bitcoin/wsh/* — multisig endpoints
+    wallet.js            # /api/bitcoin/wallets/* — wallet management + convenience signing
+    signing.js           # /api/bitcoin/signing/v1/* — signing service API endpoints
 scripts/                 # CLI tools (demo, UTXO checker, signing test)
 ```
 

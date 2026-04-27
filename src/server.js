@@ -6,6 +6,8 @@ const rateLimit = require('express-rate-limit');
 
 const bitcoinRoutes = require('./routes/bitcoin');
 const multisigRoutes = require('./routes/multisig');
+const walletRoutes = require('./routes/wallet');
+const signingRoutes = require('./routes/signing');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -65,6 +67,18 @@ app.get('/api/status', (req, res) => {
         'POST /api/bitcoin/wsh/sign-psbt',
         'POST /api/bitcoin/wsh/finalize-psbt',
         'POST /api/bitcoin/wsh/send',
+        'POST /api/bitcoin/wallets',
+        'GET  /api/bitcoin/wallets',
+        'GET  /api/bitcoin/wallets/:walletId',
+        'GET  /api/bitcoin/wallets/:walletId/addresses',
+        'GET  /api/bitcoin/wallets/:walletId/public-key',
+        'POST /api/bitcoin/wallets/:walletId/sign-transaction',
+        'GET  /api/bitcoin/wallets/:walletId/sign-transaction/:signatureId',
+        'POST /api/bitcoin/wallets/:walletId/send',
+        'POST /api/bitcoin/wallets/:walletId/broadcast/:signatureId',
+        'POST /api/bitcoin/signing/v1/signature-requests',
+        'GET  /api/bitcoin/signing/v1/signature-requests/:signatureId',
+        'POST /api/bitcoin/signing/v1/sign',
       ],
     },
   });
@@ -73,6 +87,8 @@ app.get('/api/status', (req, res) => {
 // Routes
 app.use('/api/bitcoin', bitcoinRoutes);
 app.use('/api/bitcoin/wsh', multisigRoutes);
+app.use('/api/bitcoin/wallets', walletRoutes);
+app.use('/api/bitcoin/signing', signingRoutes);
 
 // 404 handler
 app.use((req, res) => {
